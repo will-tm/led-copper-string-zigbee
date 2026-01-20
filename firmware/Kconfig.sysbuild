@@ -1,0 +1,16 @@
+#
+# Sysbuild Kconfig for LED Copper String Controller
+#
+
+if BOOTLOADER_MCUBOOT
+
+# DFU multi-image support for Zigbee OTA
+config DFU_MULTI_IMAGE_PACKAGE_BUILD
+	default y
+
+config DFU_MULTI_IMAGE_PACKAGE_APP
+	default y
+
+endif # BOOTLOADER_MCUBOOT
+
+source "${ZEPHYR_BASE}/share/sysbuild/Kconfig"

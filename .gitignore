@@ -1,0 +1,22 @@
+# Build output
+build/
+
+# West workspace and SDK dependencies
+.west
+deps
+
+# Python virtual environment
+.venv
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Cache
+.cache/

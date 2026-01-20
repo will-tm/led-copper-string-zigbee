@@ -1,0 +1,15 @@
+# Application-specific Kconfig options
+
+menu "Application Configuration"
+
+config APP_TB6612_POLARITY_FREQ_HZ
+	int "TB6612 polarity alternation frequency (Hz)"
+	default 100
+	help
+	  How fast to alternate polarity to light both LED halves.
+	  Higher values = smoother appearance but more CPU usage.
+	  100Hz is a good starting point (invisible flicker).
+
+endmenu
+
+source "Kconfig.zephyr"

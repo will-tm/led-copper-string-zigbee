@@ -1,0 +1,25 @@
+# West manifest for LED Copper String Zigbee Controller
+# Uses ncs-zigbee add-on (pulls in nRF Connect SDK v3.1.0)
+#
+# Setup (from this directory):
+#   mkdir .west && echo -e '[manifest]\npath = .\nfile = west.yml\n\n[zephyr]\nbase = deps/zephyr' > .west/config
+#   west update
+#   ./build.sh
+
+manifest:
+  version: "1.0"
+
+  remotes:
+    - name: ncs
+      url-base: https://github.com/nrfconnect
+
+  defaults:
+    remote: ncs
+
+  projects:
+    # Zigbee R23 add-on - provides Zigbee support and imports SDK v3.1.0
+    - name: ncs-zigbee
+      repo-path: ncs-zigbee
+      revision: nRF54LM20-preview1
+      import:
+        path-prefix: deps
