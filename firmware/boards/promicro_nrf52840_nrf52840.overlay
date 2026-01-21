@@ -8,6 +8,11 @@
  * - AIN2:    P0.17 - Polarity control 2
  * - STANDBY: P0.24 - Power save (HIGH = active, LOW = standby)
  *
+ * Battery Measurement (voltage divider):
+ * - VBATT -> 1MΩ -> P0.31 (AIN7) -> 1MΩ -> P0.29
+ * - P0.29: Drive LOW to enable divider, high-Z when idle
+ * - P0.31: Analog input (AIN7), measures VBATT/2
+ *
  * Other:
  * - Pairing Button: P0.06 (D1) - Active low with internal pull-up
  * - Status LED: P0.15 (onboard) - For network status indication
@@ -64,6 +69,15 @@
 			gpios = <&gpio0 6 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
 			label = "Pairing Button";
 			zephyr,code = <INPUT_KEY_0>;
+		};
+	};
+
+	/* Battery voltage divider control */
+	battery_divider {
+		compatible = "gpio-leds";
+		batt_divider_gnd: batt_gnd {
+			gpios = <&gpio0 29 GPIO_ACTIVE_LOW>;
+			label = "Battery Divider GND";
 		};
 	};
 };
