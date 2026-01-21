@@ -10,6 +10,13 @@ config APP_TB6612_POLARITY_FREQ_HZ
 	  Higher values = smoother appearance but more CPU usage.
 	  100Hz is a good starting point (invisible flicker).
 
+config APP_BATTERY_REPORT_INTERVAL_SEC
+	int "Battery report interval in seconds"
+	default 3600
+	help
+	  How often to report battery level to the Zigbee coordinator.
+	  Default is 3600 seconds (1 hour). Also reports on network join.
+
 endmenu
 
 source "Kconfig.zephyr"

@@ -19,8 +19,10 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/pwm.h>
+#include <zephyr/drivers/adc.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
+#include <hal/nrf_saadc.h>
 
 #include <zboss_api.h>
 #include <zboss_api_addons.h>
@@ -28,6 +30,7 @@
 #include <zigbee/zigbee_app_utils.h>
 #include <zigbee/zigbee_error_handler.h>
 #include <zb_nrf_platform.h>
+#include <zcl/zb_zcl_power_config.h>
 #include "zb_dimmable_light.h"
 
 #ifdef CONFIG_ZIGBEE_FOTA
@@ -72,6 +75,16 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 #define POLARITY_PERIOD_US              10000U  /* 100Hz default */
 #endif
 
+/* Battery measurement configuration */
+#ifdef CONFIG_APP_BATTERY_REPORT_INTERVAL_SEC
+#define BATTERY_REPORT_INTERVAL_SEC     CONFIG_APP_BATTERY_REPORT_INTERVAL_SEC
+#else
+#define BATTERY_REPORT_INTERVAL_SEC     3600U   /* 1 hour default */
+#endif
+
+/* Battery endpoint - use same endpoint as light for simplicity */
+#define BATTERY_ENDPOINT                LIGHT_ENDPOINT
+
 /* ==========================================================================
  * Device Tree
  * ========================================================================== */
@@ -110,6 +123,17 @@ typedef struct {
 	zb_uint8_t  start_up_current_level; /* Startup level: 0=min, 0xFF=previous, other=specific */
 } level_control_attrs_ext_t;
 
+/* Power Configuration cluster attributes for battery */
+typedef struct {
+	zb_uint8_t  battery_voltage;          /* In units of 100mV */
+	zb_uint8_t  battery_percentage;       /* 0-200 (0.5% per unit, 200 = 100%) */
+	zb_uint8_t  battery_size;
+	zb_uint16_t battery_quantity;
+	zb_uint8_t  battery_rated_voltage;    /* In units of 100mV */
+	zb_uint8_t  battery_alarm_mask;
+	zb_uint8_t  battery_voltage_min_threshold;
+} power_config_attrs_t;
+
 typedef struct {
 	zb_zcl_basic_attrs_ext_t     basic_attr;
 	zb_zcl_identify_attrs_t      identify_attr;
@@ -117,6 +141,7 @@ typedef struct {
 	zb_zcl_groups_attrs_t        groups_attr;
 	on_off_attrs_ext_t           on_off_attr;
 	level_control_attrs_ext_t    level_control_attr;
+	power_config_attrs_t         power_config_attr;
 } light_device_ctx_t;
 
 static light_device_ctx_t dev_ctx;
@@ -143,6 +168,10 @@ static uint8_t effect_step;
 static struct k_timer polarity_timer;
 static volatile bool polarity_phase;  /* false=AIN1 high, true=AIN2 high */
 static volatile bool light_is_on;
+
+/* Battery measurement state */
+static struct k_work_delayable battery_work;
+static const struct device *adc_dev;
 
 /* ==========================================================================
  * TB6612 H-Bridge Control
@@ -362,19 +391,111 @@ ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_LEVEL_CONTROL_START_UP_CURRENT_LEVEL_ID, (&dev_
 ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_LEVEL_CONTROL_MOVE_STATUS_ID, (&level_control_move_status))
 ZB_ZCL_FINISH_DECLARE_ATTRIB_LIST;
 
-ZB_DECLARE_DIMMABLE_LIGHT_CLUSTER_LIST(
-	light_clusters,
-	basic_attr_list,
-	identify_attr_list,
-	groups_attr_list,
-	scenes_attr_list,
-	on_off_attr_list,
-	level_control_attr_list);
+/* Power Configuration cluster attribute list for battery (custom to include percentage) */
+ZB_ZCL_START_DECLARE_ATTRIB_LIST_CLUSTER_REVISION(power_config_attr_list, ZB_ZCL_POWER_CONFIG)
+ZB_SET_ATTR_DESCR_WITH_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID(&dev_ctx.power_config_attr.battery_voltage, ),
+ZB_SET_ATTR_DESCR_WITH_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID(&dev_ctx.power_config_attr.battery_percentage, ),
+ZB_SET_ATTR_DESCR_WITH_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_SIZE_ID(&dev_ctx.power_config_attr.battery_size, ),
+ZB_SET_ATTR_DESCR_WITH_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_QUANTITY_ID(&dev_ctx.power_config_attr.battery_quantity, ),
+ZB_SET_ATTR_DESCR_WITH_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_RATED_VOLTAGE_ID(&dev_ctx.power_config_attr.battery_rated_voltage, ),
+ZB_SET_ATTR_DESCR_WITH_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_ALARM_MASK_ID(&dev_ctx.power_config_attr.battery_alarm_mask, ),
+ZB_SET_ATTR_DESCR_WITH_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_MIN_THRESHOLD_ID(&dev_ctx.power_config_attr.battery_voltage_min_threshold, ),
+ZB_ZCL_FINISH_DECLARE_ATTRIB_LIST;
 
-ZB_DECLARE_DIMMABLE_LIGHT_EP(
+/* Custom cluster list with Power Configuration - 7 clusters total */
+zb_zcl_cluster_desc_t light_clusters[] = {
+	ZB_ZCL_CLUSTER_DESC(
+		ZB_ZCL_CLUSTER_ID_IDENTIFY,
+		ZB_ZCL_ARRAY_SIZE(identify_attr_list, zb_zcl_attr_t),
+		(identify_attr_list),
+		ZB_ZCL_CLUSTER_SERVER_ROLE,
+		ZB_ZCL_MANUF_CODE_INVALID
+	),
+	ZB_ZCL_CLUSTER_DESC(
+		ZB_ZCL_CLUSTER_ID_BASIC,
+		ZB_ZCL_ARRAY_SIZE(basic_attr_list, zb_zcl_attr_t),
+		(basic_attr_list),
+		ZB_ZCL_CLUSTER_SERVER_ROLE,
+		ZB_ZCL_MANUF_CODE_INVALID
+	),
+	ZB_ZCL_CLUSTER_DESC(
+		ZB_ZCL_CLUSTER_ID_SCENES,
+		ZB_ZCL_ARRAY_SIZE(scenes_attr_list, zb_zcl_attr_t),
+		(scenes_attr_list),
+		ZB_ZCL_CLUSTER_SERVER_ROLE,
+		ZB_ZCL_MANUF_CODE_INVALID
+	),
+	ZB_ZCL_CLUSTER_DESC(
+		ZB_ZCL_CLUSTER_ID_GROUPS,
+		ZB_ZCL_ARRAY_SIZE(groups_attr_list, zb_zcl_attr_t),
+		(groups_attr_list),
+		ZB_ZCL_CLUSTER_SERVER_ROLE,
+		ZB_ZCL_MANUF_CODE_INVALID
+	),
+	ZB_ZCL_CLUSTER_DESC(
+		ZB_ZCL_CLUSTER_ID_ON_OFF,
+		ZB_ZCL_ARRAY_SIZE(on_off_attr_list, zb_zcl_attr_t),
+		(on_off_attr_list),
+		ZB_ZCL_CLUSTER_SERVER_ROLE,
+		ZB_ZCL_MANUF_CODE_INVALID
+	),
+	ZB_ZCL_CLUSTER_DESC(
+		ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL,
+		ZB_ZCL_ARRAY_SIZE(level_control_attr_list, zb_zcl_attr_t),
+		(level_control_attr_list),
+		ZB_ZCL_CLUSTER_SERVER_ROLE,
+		ZB_ZCL_MANUF_CODE_INVALID
+	),
+	ZB_ZCL_CLUSTER_DESC(
+		ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+		ZB_ZCL_ARRAY_SIZE(power_config_attr_list, zb_zcl_attr_t),
+		(power_config_attr_list),
+		ZB_ZCL_CLUSTER_SERVER_ROLE,
+		ZB_ZCL_MANUF_CODE_INVALID
+	),
+};
+
+/* Simple descriptor for dimmable light with Power Config (7 in clusters) */
+ZB_DECLARE_SIMPLE_DESC(7, 0);
+
+ZB_AF_SIMPLE_DESC_TYPE(7, 0) simple_desc_light_ep = {
+	.endpoint = LIGHT_ENDPOINT,
+	.app_profile_id = ZB_AF_HA_PROFILE_ID,
+	.app_device_id = ZB_DIMMABLE_LIGHT_DEVICE_ID,
+	.app_device_version = ZB_DEVICE_VER_DIMMABLE_LIGHT,
+	.reserved = 0,
+	.app_input_cluster_count = 7,
+	.app_output_cluster_count = 0,
+	.app_cluster_list = {
+		ZB_ZCL_CLUSTER_ID_BASIC,
+		ZB_ZCL_CLUSTER_ID_IDENTIFY,
+		ZB_ZCL_CLUSTER_ID_SCENES,
+		ZB_ZCL_CLUSTER_ID_GROUPS,
+		ZB_ZCL_CLUSTER_ID_ON_OFF,
+		ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL,
+		ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+	}
+};
+
+/* Reporting contexts */
+#define LIGHT_REPORT_ATTR_COUNT (ZB_ZCL_ON_OFF_REPORT_ATTR_COUNT + ZB_ZCL_LEVEL_CONTROL_REPORT_ATTR_COUNT)
+ZBOSS_DEVICE_DECLARE_REPORTING_CTX(reporting_info_light_ep, LIGHT_REPORT_ATTR_COUNT);
+ZBOSS_DEVICE_DECLARE_LEVEL_CONTROL_CTX(cvc_alarm_info_light_ep, 1);
+
+/* Custom endpoint declaration */
+ZB_AF_DECLARE_ENDPOINT_DESC(
 	light_ep,
 	LIGHT_ENDPOINT,
-	light_clusters);
+	ZB_AF_HA_PROFILE_ID,
+	0,
+	NULL,
+	ZB_ZCL_ARRAY_SIZE(light_clusters, zb_zcl_cluster_desc_t),
+	light_clusters,
+	(zb_af_simple_desc_1_1_t *)&simple_desc_light_ep,
+	LIGHT_REPORT_ATTR_COUNT,
+	reporting_info_light_ep,
+	1,
+	cvc_alarm_info_light_ep);
 
 #ifdef CONFIG_ZIGBEE_FOTA
 extern zb_af_endpoint_desc_t zigbee_fota_client_ep;
@@ -724,6 +845,251 @@ static void start_identify_effect(uint8_t effect_id)
 }
 
 /* ==========================================================================
+ * Battery Measurement - LiPo via VDDH (nRF52840)
+ * ========================================================================== */
+
+/*
+ * LiPo voltage to percentage lookup table.
+ * Based on typical LiPo discharge curve with values in millivolts.
+ * Converts VDDH voltage (from ADC) to battery percentage.
+ *
+ * LiPo characteristics:
+ * - Full charge: 4.20V (100%)
+ * - Nominal: 3.70V (~50%)
+ * - Cutoff: 3.00V (0%) - below this risks damage
+ *
+ * The discharge curve is non-linear:
+ * - Steep drop from 4.2V to ~4.0V
+ * - Relatively flat from 4.0V to 3.6V
+ * - Gradual drop from 3.6V to 3.3V
+ * - Steep drop below 3.3V
+ */
+struct battery_level_point {
+	uint16_t mv;      /* Voltage in millivolts */
+	uint8_t  percent; /* Percentage (0-100) */
+};
+
+static const struct battery_level_point lipo_discharge_curve[] = {
+	{ 4200, 100 },
+	{ 4150,  95 },
+	{ 4110,  90 },
+	{ 4080,  85 },
+	{ 4020,  80 },
+	{ 3980,  75 },
+	{ 3950,  70 },
+	{ 3910,  65 },
+	{ 3870,  60 },
+	{ 3840,  55 },
+	{ 3800,  50 },
+	{ 3760,  45 },
+	{ 3730,  40 },
+	{ 3690,  35 },
+	{ 3660,  30 },
+	{ 3620,  25 },
+	{ 3580,  20 },
+	{ 3500,  15 },
+	{ 3450,  10 },
+	{ 3300,   5 },
+	{ 3000,   0 },
+};
+
+#define BATTERY_CURVE_SIZE ARRAY_SIZE(lipo_discharge_curve)
+
+/**
+ * Convert battery voltage (mV) to percentage using lookup table with interpolation.
+ */
+static uint8_t battery_mv_to_percent(uint16_t mv)
+{
+	if (mv >= lipo_discharge_curve[0].mv) {
+		return 100;
+	}
+
+	if (mv <= lipo_discharge_curve[BATTERY_CURVE_SIZE - 1].mv) {
+		return 0;
+	}
+
+	/* Find the two points to interpolate between */
+	for (size_t i = 0; i < BATTERY_CURVE_SIZE - 1; i++) {
+		if (mv >= lipo_discharge_curve[i + 1].mv) {
+			/* Linear interpolation */
+			uint16_t v_high = lipo_discharge_curve[i].mv;
+			uint16_t v_low = lipo_discharge_curve[i + 1].mv;
+			uint8_t p_high = lipo_discharge_curve[i].percent;
+			uint8_t p_low = lipo_discharge_curve[i + 1].percent;
+
+			uint16_t v_range = v_high - v_low;
+			uint8_t p_range = p_high - p_low;
+
+			return p_low + ((mv - v_low) * p_range) / v_range;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * Measure VDDH voltage using nRF52840 SAADC.
+ * Returns voltage in millivolts.
+ */
+static uint16_t battery_measure_mv(void)
+{
+	int16_t sample;
+	uint16_t voltage_mv;
+
+	if (!adc_dev) {
+		LOG_ERR("ADC not initialized");
+		return 0;
+	}
+
+	/* Configure SAADC for VDD measurement
+	 * nRF52840 SAADC can measure VDD directly using internal channel
+	 * Input: VDD/5 (internal divider)
+	 * Reference: Internal 0.6V
+	 * Gain: 1/6
+	 * Resolution: 12-bit
+	 *
+	 * Voltage = (sample * reference * gain_divisor) / (resolution * input_divider)
+	 * Voltage = (sample * 0.6 * 6) / (4096 * 1/5)
+	 * Voltage = (sample * 3.6) / (4096 / 5)
+	 * Voltage = (sample * 3.6 * 5) / 4096
+	 * Voltage = sample * 18 / 4096 (in volts)
+	 * Voltage_mV = sample * 18000 / 4096
+	 */
+
+	struct adc_channel_cfg channel_cfg = {
+		.gain = ADC_GAIN_1_6,
+		.reference = ADC_REF_INTERNAL,
+		.acquisition_time = ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40),
+		.channel_id = 0,
+		.input_positive = SAADC_CH_PSELP_PSELP_VDD,
+	};
+
+	int ret = adc_channel_setup(adc_dev, &channel_cfg);
+	if (ret < 0) {
+		LOG_ERR("ADC channel setup failed: %d", ret);
+		return 0;
+	}
+
+	struct adc_sequence sequence = {
+		.channels = BIT(0),
+		.buffer = &sample,
+		.buffer_size = sizeof(sample),
+		.resolution = 12,
+	};
+
+	ret = adc_read(adc_dev, &sequence);
+	if (ret < 0) {
+		LOG_ERR("ADC read failed: %d", ret);
+		return 0;
+	}
+
+	/* Convert to millivolts
+	 * VDD measurement uses internal 1/5 divider and 0.6V reference
+	 * With gain 1/6: measured = VDD * (1/5) / (0.6 * 6) * 4096
+	 * VDD = measured * 0.6 * 6 * 5 / 4096
+	 * VDD_mV = measured * 18000 / 4096 = measured * 4.395
+	 */
+	voltage_mv = (uint32_t)sample * 18000U / 4096U;
+
+	LOG_DBG("Battery ADC: %d -> %u mV", sample, voltage_mv);
+
+	return voltage_mv;
+}
+
+/**
+ * Update battery attributes and report to coordinator.
+ */
+static void battery_update_and_report(void)
+{
+	uint16_t voltage_mv = battery_measure_mv();
+
+	if (voltage_mv == 0) {
+		LOG_WRN("Battery measurement failed");
+		return;
+	}
+
+	uint8_t percent = battery_mv_to_percent(voltage_mv);
+
+	/* Update attributes
+	 * battery_voltage is in units of 100mV (ZCL spec)
+	 * battery_percentage is 0-200 (0.5% per unit, so 200 = 100%)
+	 */
+	dev_ctx.power_config_attr.battery_voltage = voltage_mv / 100;
+	dev_ctx.power_config_attr.battery_percentage = percent * 2; /* Convert to 0.5% units */
+
+	LOG_INF("Battery: %u mV (%u%%)", voltage_mv, percent);
+
+	/* Report to coordinator if joined */
+	if (ZB_JOINED()) {
+		ZB_ZCL_SET_ATTRIBUTE(
+			BATTERY_ENDPOINT,
+			ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+			ZB_ZCL_CLUSTER_SERVER_ROLE,
+			ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,
+			(zb_uint8_t *)&dev_ctx.power_config_attr.battery_voltage,
+			ZB_FALSE);
+
+		LOG_DBG("Battery level reported");
+	}
+}
+
+/**
+ * Battery report work handler - called periodically.
+ */
+static void battery_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	battery_update_and_report();
+
+	/* Reschedule for next report */
+	k_work_schedule(&battery_work, K_SECONDS(BATTERY_REPORT_INTERVAL_SEC));
+}
+
+/**
+ * Initialize battery measurement.
+ */
+static int battery_init(void)
+{
+	adc_dev = DEVICE_DT_GET(DT_NODELABEL(adc));
+	if (!device_is_ready(adc_dev)) {
+		LOG_ERR("ADC device not ready");
+		return -ENODEV;
+	}
+
+	/* Initialize power config attributes */
+	dev_ctx.power_config_attr.battery_voltage = 0;
+	dev_ctx.power_config_attr.battery_percentage = 0;
+	dev_ctx.power_config_attr.battery_size = ZB_ZCL_POWER_CONFIG_BATTERY_SIZE_OTHER; /* LiPo */
+	dev_ctx.power_config_attr.battery_quantity = 1;
+	dev_ctx.power_config_attr.battery_rated_voltage = 37; /* 3.7V nominal in 100mV units */
+	dev_ctx.power_config_attr.battery_alarm_mask = 0;
+	dev_ctx.power_config_attr.battery_voltage_min_threshold = 30; /* 3.0V in 100mV units */
+
+	/* Initialize work item */
+	k_work_init_delayable(&battery_work, battery_work_handler);
+
+	LOG_INF("Battery measurement initialized");
+
+	return 0;
+}
+
+/**
+ * Start periodic battery reporting.
+ * Called after network join.
+ */
+static void battery_start_reporting(void)
+{
+	/* Do an immediate measurement and report */
+	battery_update_and_report();
+
+	/* Schedule periodic reports */
+	k_work_schedule(&battery_work, K_SECONDS(BATTERY_REPORT_INTERVAL_SEC));
+
+	LOG_INF("Battery reporting started (interval: %u sec)", BATTERY_REPORT_INTERVAL_SEC);
+}
+
+/* ==========================================================================
  * Status LED - Blinks when not joined, off when joined
  * ========================================================================== */
 
@@ -871,7 +1237,7 @@ static void clusters_attr_init(void)
 	dev_ctx.basic_attr.app_version = BULB_INIT_BASIC_APP_VERSION;
 	dev_ctx.basic_attr.stack_version = BULB_INIT_BASIC_STACK_VERSION;
 	dev_ctx.basic_attr.hw_version = BULB_INIT_BASIC_HW_VERSION;
-	dev_ctx.basic_attr.power_source = ZB_ZCL_BASIC_POWER_SOURCE_DC_SOURCE;
+	dev_ctx.basic_attr.power_source = ZB_ZCL_BASIC_POWER_SOURCE_BATTERY;
 	dev_ctx.basic_attr.ph_env = BULB_INIT_BASIC_PH_ENV;
 
 	ZB_ZCL_SET_STRING_VAL(
@@ -1091,6 +1457,9 @@ void zboss_signal_handler(zb_bufid_t bufid)
 			/* Set poll interval for sleepy end device */
 			zb_zdo_pim_set_long_poll_interval(SED_POLL_INTERVAL_MS);
 			LOG_INF("Sleepy End Device: poll interval %d ms", SED_POLL_INTERVAL_MS);
+
+			/* Start battery reporting now that we've joined */
+			battery_start_reporting();
 		}
 	}
 
@@ -1135,6 +1504,13 @@ static int hardware_init(void)
 	ret = button_init();
 	if (ret < 0) {
 		return ret;
+	}
+
+	/* Battery measurement */
+	ret = battery_init();
+	if (ret < 0) {
+		LOG_WRN("Battery init failed: %d (continuing without battery)", ret);
+		/* Don't fail - battery is optional */
 	}
 
 	/* Initialize work items */
