@@ -76,11 +76,13 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 #endif
 
 /* Battery measurement configuration */
-#ifdef CONFIG_APP_BATTERY_REPORT_INTERVAL_SEC
-#define BATTERY_REPORT_INTERVAL_SEC     CONFIG_APP_BATTERY_REPORT_INTERVAL_SEC
-#else
-#define BATTERY_REPORT_INTERVAL_SEC     600U   /* 10 minutes default */
-#endif
+// #ifdef CONFIG_APP_BATTERY_REPORT_INTERVAL_SEC
+// #define BATTERY_REPORT_INTERVAL_SEC     CONFIG_APP_BATTERY_REPORT_INTERVAL_SEC
+// #else
+// #define BATTERY_REPORT_INTERVAL_SEC     3600U   /* 1 hour default */
+// #endif
+
+#define BATTERY_REPORT_INTERVAL_SEC 10
 
 /* Battery endpoint - use same endpoint as light for simplicity */
 #define BATTERY_ENDPOINT                LIGHT_ENDPOINT
@@ -530,47 +532,63 @@ ZBOSS_DECLARE_DEVICE_CTX_1_EP(
  * ========================================================================== */
 
 /*
- * CIE 1931 lightness correction lookup table.
- * Maps linear input (0-255) to perceptually linear PWM output (0-255).
- * Human vision perceives brightness logarithmically, so this table
- * compensates to make dimming feel smooth and linear.
+ * CIE 1931 lightness correction.
+ * Human vision perceives brightness logarithmically. This function converts
+ * linear brightness (0-65535) to perceptually linear PWM output.
+ *
+ * Uses 16-bit input for smooth transitions - the high resolution allows
+ * sub-step interpolation during fades, eliminating visible stepping.
+ *
+ * Formula: Y = ((L* + 16) / 116)^3 for L* > 8
+ *          Y = L* / 903.3 for L* <= 8
+ * Where L* is perceptual lightness (0-100) and Y is luminance (0-1)
  */
-static const uint8_t cie1931_lut[256] = {
-	  0,   0,   0,   0,   0,   1,   1,   1,   1,   1,   1,   1,   1,   1,   2,   2,
-	  2,   2,   2,   2,   2,   2,   2,   3,   3,   3,   3,   3,   3,   3,   3,   4,
-	  4,   4,   4,   4,   4,   5,   5,   5,   5,   5,   6,   6,   6,   6,   6,   7,
-	  7,   7,   7,   8,   8,   8,   8,   9,   9,   9,  10,  10,  10,  10,  11,  11,
-	 11,  12,  12,  12,  13,  13,  13,  14,  14,  15,  15,  15,  16,  16,  17,  17,
-	 17,  18,  18,  19,  19,  20,  20,  21,  21,  22,  22,  23,  23,  24,  24,  25,
-	 25,  26,  26,  27,  28,  28,  29,  29,  30,  31,  31,  32,  32,  33,  34,  34,
-	 35,  36,  37,  37,  38,  39,  39,  40,  41,  42,  43,  43,  44,  45,  46,  47,
-	 47,  48,  49,  50,  51,  52,  53,  54,  54,  55,  56,  57,  58,  59,  60,  61,
-	 62,  63,  64,  65,  66,  67,  68,  70,  71,  72,  73,  74,  75,  76,  77,  79,
-	 80,  81,  82,  83,  85,  86,  87,  88,  90,  91,  92,  94,  95,  96,  98,  99,
-	100, 102, 103, 105, 106, 108, 109, 110, 112, 113, 115, 116, 118, 120, 121, 123,
-	124, 126, 128, 129, 131, 132, 134, 136, 138, 139, 141, 143, 145, 146, 148, 150,
-	152, 154, 155, 157, 159, 161, 163, 165, 167, 169, 171, 173, 175, 177, 179, 181,
-	183, 185, 187, 189, 191, 193, 196, 198, 200, 202, 204, 207, 209, 211, 214, 216,
-	218, 220, 223, 225, 228, 230, 232, 235, 237, 240, 242, 245, 247, 250, 252, 255,
-};
-
-/* Track actual PWM brightness for transitions */
-static uint8_t current_brightness;
-
-static void light_set_brightness(zb_uint8_t brightness)
+static uint32_t cie1931_correct(uint16_t brightness, uint32_t max_output)
 {
-	/* Apply CIE 1931 perceptual correction */
-	uint8_t corrected = cie1931_lut[brightness];
+	if (brightness == 0) {
+		return 0;
+	}
 
-	/* Calculate pulse width */
-	uint32_t pulse = (uint64_t)corrected * pwm_brightness.period / 255U;
+	/* Scale input to 0-100 range (L* perceptual lightness) */
+	/* brightness is 0-65535, so L* = brightness * 100 / 65535 */
+	uint32_t L_star_x100 = (uint32_t)brightness * 100 / 65535;
+
+	uint32_t Y_scaled;
+	if (L_star_x100 <= 8) {
+		/* Linear region: Y = L* / 903.3 */
+		/* Y_scaled = (L* / 903.3) * max_output = L* * max_output / 903 */
+		Y_scaled = L_star_x100 * max_output / 903;
+	} else {
+		/* Cubic region: Y = ((L* + 16) / 116)^3 */
+		/* Using fixed-point math: scale by 1000 for precision */
+		uint32_t term = (L_star_x100 + 16) * 1000 / 116; /* 0-1000 range */
+		/* Cube it: (term/1000)^3 * max_output = term^3 * max_output / 1e9 */
+		uint64_t cubed = (uint64_t)term * term * term;
+		Y_scaled = cubed * max_output / 1000000000ULL;
+	}
+
+	/* Ensure minimum output of 1 when brightness > 0 (so LEDs don't turn off) */
+	if (Y_scaled == 0 && brightness > 0) {
+		Y_scaled = 1;
+	}
+
+	return Y_scaled;
+}
+
+/* Track actual brightness for transitions (16-bit for smooth fades) */
+static uint16_t current_brightness_16;
+
+static void light_set_brightness_16(uint16_t brightness)
+{
+	/* Apply CIE 1931 perceptual correction directly to PWM resolution */
+	uint32_t pulse = cie1931_correct(brightness, pwm_brightness.period);
 
 	if (pwm_set_pulse_dt(&pwm_brightness, pulse)) {
 		LOG_ERR("PWM set failed");
 		return;
 	}
 
-	current_brightness = brightness;
+	current_brightness_16 = brightness;
 
 	/* Control TB6612 on/off based on brightness */
 	if (brightness > 0 && !light_is_on) {
@@ -579,7 +597,15 @@ static void light_set_brightness(zb_uint8_t brightness)
 		tb6612_off();
 	}
 
-	LOG_DBG("Brightness: %u -> %u (pulse: %u)", brightness, corrected, pulse);
+	LOG_DBG("Brightness16: %u (pulse: %u/%u)", brightness, pulse, pwm_brightness.period);
+}
+
+/* 8-bit wrapper for ZCL compatibility (level 0-254 maps to 0-65535) */
+static void light_set_brightness(zb_uint8_t brightness)
+{
+	/* Scale 8-bit (0-254) to 16-bit (0-65535) for smooth CIE correction */
+	uint16_t brightness_16 = (brightness == 0) ? 0 : ((uint32_t)brightness * 65535 / 254);
+	light_set_brightness_16(brightness_16);
 }
 
 /* ==========================================================================
@@ -589,8 +615,8 @@ static void light_set_brightness(zb_uint8_t brightness)
 #define TRANSITION_STEP_MS 16 /* Update every 16ms for ~60Hz */
 
 static struct k_work_delayable transition_work;
-static uint8_t transition_start;
-static uint8_t transition_target;
+static uint16_t transition_start_16;
+static uint16_t transition_target_16;
 static int64_t transition_start_time;
 static uint16_t transition_duration;
 
@@ -604,13 +630,13 @@ static void transition_work_handler(struct k_work *work)
 
 	if (elapsed >= transition_duration) {
 		/* Transition complete */
-		light_set_brightness(transition_target);
+		light_set_brightness_16(transition_target_16);
 	} else {
-		/* Linear interpolation using actual elapsed time */
-		int32_t diff = (int32_t)transition_target - (int32_t)transition_start;
-		uint8_t current = transition_start +
+		/* Linear interpolation using actual elapsed time (16-bit for smooth steps) */
+		int32_t diff = (int32_t)transition_target_16 - (int32_t)transition_start_16;
+		uint16_t current = transition_start_16 +
 			(diff * (int32_t)elapsed / (int32_t)transition_duration);
-		light_set_brightness(current);
+		light_set_brightness_16(current);
 
 		/* Schedule next step - calculate time until next step boundary
 		 * to maintain consistent timing even if this callback was delayed */
@@ -623,24 +649,32 @@ static void transition_work_handler(struct k_work *work)
 	}
 }
 
+/* Convert 8-bit ZCL level to 16-bit internal brightness */
+static inline uint16_t level_to_brightness16(uint8_t level)
+{
+	return (level == 0) ? 0 : ((uint32_t)level * 65535 / 254);
+}
+
 static void light_fade_to(uint8_t target, uint16_t duration_ms)
 {
 	/* Cancel any ongoing transition */
 	k_work_cancel_delayable(&transition_work);
 
-	if (duration_ms == 0 || current_brightness == target) {
+	uint16_t target_16 = level_to_brightness16(target);
+
+	if (duration_ms == 0 || current_brightness_16 == target_16) {
 		/* Instant change or already at target */
-		light_set_brightness(target);
+		light_set_brightness_16(target_16);
 		return;
 	}
 
-	/* Start from actual current PWM brightness */
-	transition_start = current_brightness;
-	transition_target = target;
+	/* Start from actual current PWM brightness (16-bit for smooth interpolation) */
+	transition_start_16 = current_brightness_16;
+	transition_target_16 = target_16;
 	transition_start_time = k_uptime_get();
 	transition_duration = duration_ms;
 
-	LOG_INF("Fade: %u -> %u over %ums", transition_start, target, duration_ms);
+	LOG_INF("Fade: %u -> %u over %ums", transition_start_16, target_16, duration_ms);
 
 	/* Start transition immediately */
 	k_work_schedule(&transition_work, K_NO_WAIT);
