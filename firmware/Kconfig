@@ -12,7 +12,7 @@ config APP_TB6612_POLARITY_FREQ_HZ
 
 config APP_BATTERY_REPORT_INTERVAL_SEC
 	int "Battery report interval in seconds"
-	default 3600
+	default 600
 	help
 	  How often to report battery level to the Zigbee coordinator.
 	  Default is 3600 seconds (1 hour). Also reports on network join.

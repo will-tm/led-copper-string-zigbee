@@ -76,13 +76,11 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 #endif
 
 /* Battery measurement configuration */
-// #ifdef CONFIG_APP_BATTERY_REPORT_INTERVAL_SEC
-// #define BATTERY_REPORT_INTERVAL_SEC     CONFIG_APP_BATTERY_REPORT_INTERVAL_SEC
-// #else
-// #define BATTERY_REPORT_INTERVAL_SEC     3600U   /* 1 hour default */
-// #endif
-
-#define BATTERY_REPORT_INTERVAL_SEC 10
+#ifdef CONFIG_APP_BATTERY_REPORT_INTERVAL_SEC
+#define BATTERY_REPORT_INTERVAL_SEC     CONFIG_APP_BATTERY_REPORT_INTERVAL_SEC
+#else
+#define BATTERY_REPORT_INTERVAL_SEC     3600U   /* 1 hour default */
+#endif
 
 /* Battery endpoint - use same endpoint as light for simplicity */
 #define BATTERY_ENDPOINT                LIGHT_ENDPOINT
@@ -494,8 +492,9 @@ ZB_AF_SIMPLE_DESC_TYPE(7, 0) simple_desc_light_ep = {
 	}
 };
 
-/* Reporting contexts */
-#define LIGHT_REPORT_ATTR_COUNT (ZB_ZCL_ON_OFF_REPORT_ATTR_COUNT + ZB_ZCL_LEVEL_CONTROL_REPORT_ATTR_COUNT)
+/* Reporting contexts - include Power Configuration for battery reporting */
+#define POWER_CONFIG_REPORT_ATTR_COUNT 3  /* battery_voltage, battery_percentage, raw_mv */
+#define LIGHT_REPORT_ATTR_COUNT (ZB_ZCL_ON_OFF_REPORT_ATTR_COUNT + ZB_ZCL_LEVEL_CONTROL_REPORT_ATTR_COUNT + POWER_CONFIG_REPORT_ATTR_COUNT)
 ZBOSS_DEVICE_DECLARE_REPORTING_CTX(reporting_info_light_ep, LIGHT_REPORT_ATTR_COUNT);
 ZBOSS_DEVICE_DECLARE_LEVEL_CONTROL_CTX(cvc_alarm_info_light_ep, 1);
 
@@ -986,19 +985,32 @@ static uint8_t battery_mv_to_percent(uint16_t mv)
 	return 0;
 }
 
+/* Battery voltage filtering */
+#define BATTERY_OVERSAMPLE_SHIFT  3     /* 2^3 = 8x hardware oversampling */
+#define BATTERY_SOFTWARE_SAMPLES  4     /* Additional software averaging */
+#define BATTERY_FILTER_ALPHA      64    /* EMA alpha (0-256), 64 = ~25% new value */
+
+static uint16_t battery_filtered_mv;    /* Exponential moving average result */
+
 /**
- * Measure battery voltage using external voltage divider.
+ * Measure battery voltage using external voltage divider with filtering.
  *
  * Hardware: VBATT -> 1MΩ -> P0.31 (AIN7) -> 1MΩ -> P0.29
  * - Drive P0.29 LOW to enable divider (creates path to GND)
  * - Measure VBATT/2 on P0.31 (AIN7)
  * - Set P0.29 to high-impedance when done to minimize leakage
  *
+ * Filtering:
+ * - 8x hardware oversampling (SAADC built-in)
+ * - 4x software averaging
+ * - Exponential moving average across measurements
+ *
  * Returns battery voltage in millivolts.
  */
 static uint16_t battery_measure_mv(void)
 {
 	int16_t sample;
+	int32_t sample_sum = 0;
 	uint16_t voltage_mv;
 	int ret;
 
@@ -1015,7 +1027,7 @@ static uint16_t battery_measure_mv(void)
 	}
 
 	/* Wait for voltage to settle through high-impedance divider */
-	k_usleep(100);
+	k_usleep(500);
 
 	/* Configure SAADC for AIN7 (P0.31) measurement
 	 * Reference: Internal 0.6V
@@ -1050,18 +1062,39 @@ static uint16_t battery_measure_mv(void)
 		.buffer = &sample,
 		.buffer_size = sizeof(sample),
 		.resolution = 12,
+		.oversampling = BATTERY_OVERSAMPLE_SHIFT,  /* 8x hardware oversampling */
 	};
 
-	ret = adc_read(adc_dev, &sequence);
-	if (ret < 0) {
-		LOG_ERR("ADC read failed: %d", ret);
-		goto disable_divider;
+	/* Take multiple software samples and average */
+	for (int i = 0; i < BATTERY_SOFTWARE_SAMPLES; i++) {
+		ret = adc_read(adc_dev, &sequence);
+		if (ret < 0) {
+			LOG_ERR("ADC read failed: %d", ret);
+			goto disable_divider;
+		}
+		sample_sum += sample;
+		k_usleep(100);  /* Small delay between samples */
 	}
 
-	/* Convert to millivolts (measured is VBATT/2, so multiply by 2) */
-	voltage_mv = (uint32_t)sample * 7200U / 4096U;
+	/* Average the software samples */
+	int32_t avg_sample = sample_sum / BATTERY_SOFTWARE_SAMPLES;
 
-	LOG_DBG("Battery ADC: %d -> %u mV", sample, voltage_mv);
+	/* Convert to millivolts (measured is VBATT/2, so multiply by 2) */
+	voltage_mv = (uint32_t)avg_sample * 7200U / 4096U;
+
+	/* Apply exponential moving average filter */
+	if (battery_filtered_mv == 0) {
+		/* First measurement - initialize filter */
+		battery_filtered_mv = voltage_mv;
+	} else {
+		/* EMA: filtered = alpha * new + (1-alpha) * old
+		 * Using fixed-point: filtered = (alpha * new + (256-alpha) * old) / 256 */
+		battery_filtered_mv = ((uint32_t)BATTERY_FILTER_ALPHA * voltage_mv +
+			(256 - BATTERY_FILTER_ALPHA) * battery_filtered_mv) / 256;
+	}
+
+	LOG_DBG("Battery ADC: avg=%d, raw=%umV, filtered=%umV",
+		(int)avg_sample, voltage_mv, battery_filtered_mv);
 
 disable_divider:
 	/* Disable voltage divider: set P0.29 to high-impedance (disconnected input)
@@ -1069,7 +1102,7 @@ disable_divider:
 	 */
 	gpio_pin_configure_dt(&batt_divider_gnd, GPIO_DISCONNECTED);
 
-	return (ret < 0) ? 0 : voltage_mv;
+	return (ret < 0) ? 0 : battery_filtered_mv;
 }
 
 /**
@@ -1085,12 +1118,19 @@ static void battery_mark_for_reporting(void)
 		ZB_ZCL_CLUSTER_SERVER_ROLE,
 		ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID);
 
-	/* Mark battery voltage for reporting */
+	/* Mark standard battery voltage for reporting (100mV units) */
 	zb_zcl_mark_attr_for_reporting(
 		BATTERY_ENDPOINT,
 		ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
 		ZB_ZCL_CLUSTER_SERVER_ROLE,
 		ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID);
+
+	/* Mark manufacturer-specific raw voltage for reporting (mV units) */
+	zb_zcl_mark_attr_for_reporting(
+		BATTERY_ENDPOINT,
+		ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+		ZB_ZCL_CLUSTER_SERVER_ROLE,
+		ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_RAW_MV_ID);
 
 	LOG_INF("Battery marked for reporting: %u mV (%u%%)",
 		dev_ctx.power_config_attr.battery_voltage_raw_mv,
