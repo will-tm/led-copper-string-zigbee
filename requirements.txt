@@ -8,3 +8,4 @@ pyelftools>=0.29  # Required for Zephyr build scripts
 cryptography>=41.0  # Required for MCUboot imgtool signing
 pylink-square>=1.0  # Required for J-Link flashing
 smpmgr>=0.20  # USB firmware update via MCUboot serial recovery (tools/usb_update.py)
+cmake>=3.20,<4  # NCS 3.1 / Zephyr 4.1 CMake modules fail to configure with CMake 4.x
