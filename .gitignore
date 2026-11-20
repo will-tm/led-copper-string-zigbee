@@ -20,3 +20,6 @@ deps
 
 # Cache
 .cache/
+
+# Local flash dumps (contain Zigbee network keys)
+.flash-backup/

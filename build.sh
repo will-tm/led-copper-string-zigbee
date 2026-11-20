@@ -8,12 +8,14 @@
 # Options:
 #   clean/pristine  - Clean build
 #   flash           - Flash after build (J-Link)
+#   usb             - Flash after build over USB (MCUboot serial recovery)
 
 set -e
 
 BOARD="promicro_nrf52840/nrf52840"
 PRISTINE=""
 DO_FLASH=""
+DO_USB=""
 
 # Parse options
 for arg in "$@"; do
@@ -23,6 +25,9 @@ for arg in "$@"; do
             ;;
         flash)
             DO_FLASH="1"
+            ;;
+        usb)
+            DO_USB="1"
             ;;
     esac
 done
@@ -109,7 +114,16 @@ echo "Build complete!"
 echo "========================================"
 
 # === Flash ===
-if [ -n "$DO_FLASH" ]; then
+if [ -n "$DO_USB" ]; then
+    echo ""
+    echo "Flashing over USB..."
+    command -v smpmgr &> /dev/null || pip install -r requirements.txt
+    python tools/usb_update.py build/firmware/zephyr/zephyr.signed.bin
+
+    echo "========================================"
+    echo "USB flash complete!"
+    echo "========================================"
+elif [ -n "$DO_FLASH" ]; then
     echo ""
     echo "Flashing..."
     west flash --build-dir build
@@ -120,9 +134,10 @@ if [ -n "$DO_FLASH" ]; then
 else
     echo ""
     echo "Output files in ${SCRIPT_DIR}/build/:"
-    echo "  zephyr/zephyr.signed.hex - Flash via J-Link (includes MCUboot)"
-    echo "  zephyr/app_update.bin    - OTA update file for Z2M"
+    echo "  merged.hex                       - Flash via J-Link (MCUboot + app)"
+    echo "  *.zigbee                         - Zigbee OTA image for Z2M"
     echo ""
     echo "To flash: ./build.sh flash"
-    echo "For OTA:  Copy app_update.bin to Z2M's data/otaImages/"
+    echo "For USB:  ./build.sh usb, then plug in USB (or reset the board)"
+    echo "For OTA:  Copy build/*.zigbee to Z2M's data/otaImages/"
 fi

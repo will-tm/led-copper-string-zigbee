@@ -7,3 +7,4 @@ cbor2>=5.0  # Required for DFU multi-image packaging
 pyelftools>=0.29  # Required for Zephyr build scripts
 cryptography>=41.0  # Required for MCUboot imgtool signing
 pylink-square>=1.0  # Required for J-Link flashing
+smpmgr>=0.20  # USB firmware update via MCUboot serial recovery (tools/usb_update.py)

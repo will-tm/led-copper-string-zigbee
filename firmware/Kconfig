@@ -2,20 +2,13 @@
 
 menu "Application Configuration"
 
-config APP_TB6612_POLARITY_FREQ_HZ
-	int "TB6612 polarity alternation frequency (Hz)"
-	default 100
-	help
-	  How fast to alternate polarity to light both LED halves.
-	  Higher values = smoother appearance but more CPU usage.
-	  100Hz is a good starting point (invisible flicker).
-
 config APP_BATTERY_REPORT_INTERVAL_SEC
-	int "Battery report interval in seconds"
+	int "Battery measurement interval in seconds"
 	default 600
 	help
-	  How often to report battery level to the Zigbee coordinator.
-	  Default is 3600 seconds (1 hour). Also reports on network join.
+	  How often to measure the battery and update the Power Configuration
+	  attributes. Reports are sent according to the reporting
+	  configuration set by the coordinator.
 
 endmenu
 

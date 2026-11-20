@@ -3,10 +3,10 @@
  * Target: Pro Micro nRF52840 (SuperMini, nice!nano compatible)
  *
  * TB6612 H-Bridge Pin Assignments:
- * - PWMA:    P0.22 - PWM brightness control
- * - AIN1:    P0.20 - Polarity control 1
- * - AIN2:    P0.17 - Polarity control 2
- * - STANDBY: P0.24 - Power save (HIGH = active, LOW = standby)
+ * - AIN1:    P0.20 - PWM0 ch0, normal polarity   (polarity A window)
+ * - AIN2:    P0.17 - PWM0 ch1, inverted polarity (polarity B window)
+ * - PWMA:    P0.22 - GPIO, HIGH while lit
+ * - STANDBY: P0.24 - GPIO, HIGH while lit, LOW = standby
  *
  * Battery Measurement (voltage divider):
  * - VBATT -> 1MΩ -> P0.31 (AIN7) -> 1MΩ -> P0.29
@@ -29,32 +29,36 @@
 	};
 
 	aliases {
-		pwm-led0 = &pwm_brightness;
 		sw0 = &pairing_button;
 		led0 = &led0;  /* Onboard LED (P0.15) for status */
 	};
 
-	/* PWM for TB6612 PWMA (brightness control) */
+	/*
+	 * TB6612 AIN1/AIN2. Both channels must share one PWM instance and
+	 * period; AIN2 is inverted so its pulse sits at the end of the period
+	 * and never overlaps AIN1. Period = per-polarity refresh rate (1 kHz).
+	 */
 	pwmleds {
 		compatible = "pwm-leds";
-		pwm_brightness: pwm_led_0 {
+
+		tb6612_ain1: tb6612_ain1 {
 			pwms = <&pwm0 0 PWM_MSEC(1) PWM_POLARITY_NORMAL>;
-			label = "TB6612 PWMA";
-		};
-	};
-
-	/* TB6612 GPIO control pins */
-	tb6612_ctrl {
-		compatible = "gpio-leds";
-
-		tb6612_ain1: ain1 {
-			gpios = <&gpio0 20 GPIO_ACTIVE_HIGH>;
 			label = "TB6612 AIN1";
 		};
 
-		tb6612_ain2: ain2 {
-			gpios = <&gpio0 17 GPIO_ACTIVE_HIGH>;
+		tb6612_ain2: tb6612_ain2 {
+			pwms = <&pwm0 1 PWM_MSEC(1) PWM_POLARITY_INVERTED>;
 			label = "TB6612 AIN2";
+		};
+	};
+
+	/* TB6612 static GPIO control pins */
+	tb6612_ctrl {
+		compatible = "gpio-leds";
+
+		tb6612_pwma: pwma {
+			gpios = <&gpio0 22 GPIO_ACTIVE_HIGH>;
+			label = "TB6612 PWMA";
 		};
 
 		tb6612_standby: standby {
@@ -82,17 +86,19 @@
 	};
 };
 
-/* Remap PWM0 to P0.22 for TB6612 PWMA */
+/* PWM0: ch0 -> P0.20 (AIN1), ch1 -> P0.17 (AIN2) */
 &pinctrl {
 	pwm0_default: pwm0_default {
 		group1 {
-			psels = <NRF_PSEL(PWM_OUT0, 0, 22)>;  /* P0.22 = PWMA */
+			psels = <NRF_PSEL(PWM_OUT0, 0, 20)>,
+				<NRF_PSEL(PWM_OUT1, 0, 17)>;
 		};
 	};
 
 	pwm0_sleep: pwm0_sleep {
 		group1 {
-			psels = <NRF_PSEL(PWM_OUT0, 0, 22)>;
+			psels = <NRF_PSEL(PWM_OUT0, 0, 20)>,
+				<NRF_PSEL(PWM_OUT1, 0, 17)>;
 			low-power-enable;
 		};
 	};
@@ -102,6 +108,11 @@
 	status = "okay";
 };
 
+/*
+ * Detect button edges with the GPIO SENSE (PORT event) mechanism instead of
+ * a GPIOTE IN channel, which draws considerably more current in sleep.
+ */
 &gpio0 {
 	status = "okay";
+	sense-edge-mask = <(1 << 6)>;
 };
