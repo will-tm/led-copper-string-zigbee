@@ -2,20 +2,11 @@
  * @file main.c
  * @brief LED Copper String Zigbee Controller
  *
- * Controls a special LED strip via TB6612 H-bridge where:
- * - One polarity lights half the strip
- * - Reverse polarity lights the other half
- *
- * Both polarities are generated in hardware by one PWM instance:
- * - AIN1 (PWM ch0, normal):   high during [0, D) of every period
- * - AIN2 (PWM ch1, inverted): high during [T-D, T) of every period
- * With D <= T/2 the two windows never overlap, so each half of the strip is
- * driven for D per period and brightness is set by D alone. PWMA and STBY are
- * plain GPIOs held high while the output is non-zero. No CPU activity is
- * needed to keep the light on, and at 0 the PWM peripheral is stopped.
+ * Single PWM output on P0.10 (1 kHz, active high), brightness set by its
+ * duty cycle. Generated in hardware; at 0 the PWM peripheral is stopped.
  *
  * Threading:
- * - All TB6612/PWM output changes run on the system workqueue.
+ * - All PWM output changes run on the system workqueue.
  * - All ZBOSS API calls run in the Zigbee thread; other contexts hand work
  *   over with ZB_SCHEDULE_APP_CALLBACK (thread-safe in NCS).
  */
@@ -25,15 +16,11 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/pwm.h>
-#include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/watchdog.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/reboot.h>
-#include <hal/nrf_saadc.h>
-#include <hal/nrf_power.h>
-#include <nrfx_power.h>
 #include <ram_pwrdn.h>
 
 #include <zboss_api.h>
@@ -42,7 +29,6 @@
 #include <zigbee/zigbee_app_utils.h>
 #include <zigbee/zigbee_error_handler.h>
 #include <zb_nrf_platform.h>
-#include <zcl/zb_zcl_power_config.h>
 #include "zb_dimmable_light.h"
 
 #ifdef CONFIG_ZIGBEE_FOTA
@@ -62,7 +48,7 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 #define BULB_INIT_BASIC_STACK_VERSION   1
 #define BULB_INIT_BASIC_HW_VERSION      1
 #define BULB_INIT_BASIC_MANUF_NAME      "DIY"
-#define BULB_INIT_BASIC_MODEL_ID        "LEDCopperV1"
+#define BULB_INIT_BASIC_MODEL_ID        "LEDCopperSimple"
 #define BULB_INIT_BASIC_DATE_CODE       "20260120"
 #define BULB_INIT_BASIC_LOCATION_DESC   ""
 #define BULB_INIT_BASIC_PH_ENV          ZB_ZCL_BASIC_ENV_UNSPECIFIED
@@ -102,16 +88,6 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 #define JOIN_BLINK_TIMEOUT_MS           (3 * 60 * 1000)
 #define JOIN_BLINK_PERIOD_MS            500
 
-/*
- * Sleepy End Device poll intervals. The output stage draws far more than
- * the radio while lit, so poll fast then for responsive control; poll slowly
- * while off, where battery life is decided.
- */
-#define POLL_INTERVAL_FAST_MS           250
-#define POLL_INTERVAL_SLOW_MS           3000
-/* Fast polling after joining so the coordinator can interview the device. */
-#define INTERVIEW_FAST_POLL_MS          (2 * 60 * 1000)
-
 /* Delay before persisting state, so bursts of changes cost one flash write. */
 #define STATE_SAVE_DELAY_MS             2000
 
@@ -122,53 +98,23 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 #define WDT_TIMEOUT_MS                  60000
 #define WDT_FEED_INTERVAL_MS            15000
 
-/* USB power must be present this long before rebooting into the bootloader */
-#define USB_REBOOT_DELAY_MS             500
-
-/* Battery measurement interval */
-#define BATTERY_REPORT_INTERVAL_SEC     CONFIG_APP_BATTERY_REPORT_INTERVAL_SEC
-
-/*
- * Low-battery protection on the resting voltage: the output is forced off
- * below CUTOFF and allowed again from RESUME. Released while USB is present.
- */
-#define BATTERY_CUTOFF_MV               3300
-#define BATTERY_RESUME_MV               3500
-
-/* Let the cell relax after charging before measuring it */
-#define BATTERY_AFTER_USB_DELAY_SEC     30
-
-/* Fresh battery report this long after (re)joining the network */
-#define BATTERY_JOIN_REPORT_DELAY_SEC   10
-
 /* ==========================================================================
  * Device Tree
  * ========================================================================== */
 
-/* TB6612 AIN1/AIN2 driven by the same PWM instance (shared period) */
-static const struct pwm_dt_spec pwm_ain1 = PWM_DT_SPEC_GET(DT_NODELABEL(tb6612_ain1));
-static const struct pwm_dt_spec pwm_ain2 = PWM_DT_SPEC_GET(DT_NODELABEL(tb6612_ain2));
+/* LED PWM output (P0.10) */
+static const struct pwm_dt_spec pwm_led = PWM_DT_SPEC_GET(DT_NODELABEL(led_pwm));
 
-BUILD_ASSERT(DT_SAME_NODE(DT_PWMS_CTLR(DT_NODELABEL(tb6612_ain1)),
-			  DT_PWMS_CTLR(DT_NODELABEL(tb6612_ain2))),
-	     "AIN1 and AIN2 must share one PWM instance");
-BUILD_ASSERT(DT_PWMS_PERIOD(DT_NODELABEL(tb6612_ain1)) ==
-	     DT_PWMS_PERIOD(DT_NODELABEL(tb6612_ain2)),
-	     "AIN1 and AIN2 must use the same PWM period");
-BUILD_ASSERT((DT_PWMS_FLAGS(DT_NODELABEL(tb6612_ain2)) & PWM_POLARITY_INVERTED) &&
-	     !(DT_PWMS_FLAGS(DT_NODELABEL(tb6612_ain1)) & PWM_POLARITY_INVERTED),
-	     "AIN1 must be normal and AIN2 inverted polarity");
+/* Onboard status LED (P0.15), second channel of the same PWM instance */
+static const struct pwm_dt_spec pwm_status = PWM_DT_SPEC_GET(DT_NODELABEL(status_pwm));
 
-/* TB6612 static control pins */
-static const struct gpio_dt_spec tb6612_pwma = GPIO_DT_SPEC_GET(DT_NODELABEL(tb6612_pwma), gpios);
-static const struct gpio_dt_spec tb6612_standby = GPIO_DT_SPEC_GET(DT_NODELABEL(tb6612_standby), gpios);
+BUILD_ASSERT(DT_SAME_NODE(DT_PWMS_CTLR(DT_NODELABEL(led_pwm)),
+			  DT_PWMS_CTLR(DT_NODELABEL(status_pwm))) &&
+	     DT_PWMS_PERIOD(DT_NODELABEL(led_pwm)) == DT_PWMS_PERIOD(DT_NODELABEL(status_pwm)),
+	     "LED and status PWM must share one PWM instance and period");
 
-/* Button and status LED */
+/* Button */
 static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
-static const struct gpio_dt_spec status_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
-
-/* Battery voltage divider control (P0.29 - drive LOW to enable, high-Z to disable) */
-static const struct gpio_dt_spec batt_divider_gnd = GPIO_DT_SPEC_GET(DT_NODELABEL(batt_divider_gnd), gpios);
 
 /* ==========================================================================
  * Application Context
@@ -192,18 +138,6 @@ typedef struct {
 	zb_uint8_t  start_up_current_level; /* Startup level: 0=min, 0xFF=previous, other=specific */
 } level_control_attrs_ext_t;
 
-/* Power Configuration cluster attributes for battery */
-typedef struct {
-	zb_uint8_t  battery_voltage;          /* In units of 100mV */
-	zb_uint8_t  battery_percentage;       /* 0-200 (0.5% per unit, 200 = 100%) */
-	zb_uint8_t  battery_size;
-	zb_uint8_t  battery_quantity;
-	zb_uint8_t  battery_rated_voltage;    /* In units of 100mV */
-	zb_uint8_t  battery_alarm_mask;
-	zb_uint8_t  battery_voltage_min_threshold;
-	zb_uint16_t battery_voltage_raw_mv;   /* Raw voltage in mV (manufacturer-specific) */
-} power_config_attrs_t;
-
 typedef struct {
 	zb_zcl_basic_attrs_ext_t     basic_attr;
 	zb_zcl_identify_attrs_t      identify_attr;
@@ -211,7 +145,6 @@ typedef struct {
 	zb_zcl_groups_attrs_t        groups_attr;
 	on_off_attrs_ext_t           on_off_attr;
 	level_control_attrs_ext_t    level_control_attr;
-	power_config_attrs_t         power_config_attr;
 } light_device_ctx_t;
 
 static light_device_ctx_t dev_ctx;
@@ -280,29 +213,7 @@ ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_LEVEL_CONTROL_START_UP_CURRENT_LEVEL_ID, (&dev_
 ZB_ZCL_SET_ATTR_DESC(ZB_ZCL_ATTR_LEVEL_CONTROL_MOVE_STATUS_ID, (&level_control_move_status))
 ZB_ZCL_FINISH_DECLARE_ATTRIB_LIST;
 
-/* Manufacturer-specific attribute ID for raw battery voltage in mV */
-#define ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_RAW_MV_ID  0xFF00
-
-/* Power Configuration cluster attribute list for battery (custom to include percentage and raw mV) */
-ZB_ZCL_START_DECLARE_ATTRIB_LIST_CLUSTER_REVISION(power_config_attr_list, ZB_ZCL_POWER_CONFIG)
-ZB_SET_ATTR_DESCR_WITH_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID(&dev_ctx.power_config_attr.battery_voltage, ),
-ZB_SET_ATTR_DESCR_WITH_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID(&dev_ctx.power_config_attr.battery_percentage, ),
-ZB_SET_ATTR_DESCR_WITH_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_SIZE_ID(&dev_ctx.power_config_attr.battery_size, ),
-ZB_SET_ATTR_DESCR_WITH_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_QUANTITY_ID(&dev_ctx.power_config_attr.battery_quantity, ),
-ZB_SET_ATTR_DESCR_WITH_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_RATED_VOLTAGE_ID(&dev_ctx.power_config_attr.battery_rated_voltage, ),
-ZB_SET_ATTR_DESCR_WITH_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_ALARM_MASK_ID(&dev_ctx.power_config_attr.battery_alarm_mask, ),
-ZB_SET_ATTR_DESCR_WITH_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_MIN_THRESHOLD_ID(&dev_ctx.power_config_attr.battery_voltage_min_threshold, ),
-/* Manufacturer-specific: raw voltage in mV (uint16) */
-{
-  ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_RAW_MV_ID,
-  ZB_ZCL_ATTR_TYPE_U16,
-  ZB_ZCL_ATTR_ACCESS_READ_ONLY | ZB_ZCL_ATTR_ACCESS_REPORTING,
-  (ZB_ZCL_NON_MANUFACTURER_SPECIFIC),
-  (void*) &dev_ctx.power_config_attr.battery_voltage_raw_mv
-},
-ZB_ZCL_FINISH_DECLARE_ATTRIB_LIST;
-
-/* Custom cluster list with Power Configuration - 7 clusters total */
+/* Cluster list - 6 clusters */
 zb_zcl_cluster_desc_t light_clusters[] = {
 	ZB_ZCL_CLUSTER_DESC(
 		ZB_ZCL_CLUSTER_ID_IDENTIFY,
@@ -346,25 +257,18 @@ zb_zcl_cluster_desc_t light_clusters[] = {
 		ZB_ZCL_CLUSTER_SERVER_ROLE,
 		ZB_ZCL_MANUF_CODE_INVALID
 	),
-	ZB_ZCL_CLUSTER_DESC(
-		ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-		ZB_ZCL_ARRAY_SIZE(power_config_attr_list, zb_zcl_attr_t),
-		(power_config_attr_list),
-		ZB_ZCL_CLUSTER_SERVER_ROLE,
-		ZB_ZCL_MANUF_CODE_INVALID
-	),
 };
 
-/* Simple descriptor for dimmable light with Power Config (7 in clusters) */
-ZB_DECLARE_SIMPLE_DESC(7, 0);
+/* Simple descriptor for dimmable light (6 in clusters) */
+ZB_DECLARE_SIMPLE_DESC(6, 0);
 
-ZB_AF_SIMPLE_DESC_TYPE(7, 0) simple_desc_light_ep = {
+ZB_AF_SIMPLE_DESC_TYPE(6, 0) simple_desc_light_ep = {
 	.endpoint = LIGHT_ENDPOINT,
 	.app_profile_id = ZB_AF_HA_PROFILE_ID,
 	.app_device_id = ZB_DIMMABLE_LIGHT_DEVICE_ID,
 	.app_device_version = ZB_DEVICE_VER_DIMMABLE_LIGHT,
 	.reserved = 0,
-	.app_input_cluster_count = 7,
+	.app_input_cluster_count = 6,
 	.app_output_cluster_count = 0,
 	.app_cluster_list = {
 		ZB_ZCL_CLUSTER_ID_BASIC,
@@ -373,13 +277,11 @@ ZB_AF_SIMPLE_DESC_TYPE(7, 0) simple_desc_light_ep = {
 		ZB_ZCL_CLUSTER_ID_GROUPS,
 		ZB_ZCL_CLUSTER_ID_ON_OFF,
 		ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL,
-		ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
 	}
 };
 
-/* Reporting contexts - include Power Configuration for battery reporting */
-#define POWER_CONFIG_REPORT_ATTR_COUNT 3  /* battery_voltage, battery_percentage, raw_mv */
-#define LIGHT_REPORT_ATTR_COUNT (ZB_ZCL_ON_OFF_REPORT_ATTR_COUNT + ZB_ZCL_LEVEL_CONTROL_REPORT_ATTR_COUNT + POWER_CONFIG_REPORT_ATTR_COUNT)
+/* Reporting contexts */
+#define LIGHT_REPORT_ATTR_COUNT (ZB_ZCL_ON_OFF_REPORT_ATTR_COUNT + ZB_ZCL_LEVEL_CONTROL_REPORT_ATTR_COUNT)
 ZBOSS_DEVICE_DECLARE_REPORTING_CTX(reporting_info_light_ep, LIGHT_REPORT_ATTR_COUNT);
 ZBOSS_DEVICE_DECLARE_LEVEL_CONTROL_CTX(cvc_alarm_info_light_ep, 1);
 
@@ -412,14 +314,22 @@ ZBOSS_DECLARE_DEVICE_CTX_1_EP(
 #endif
 
 /* ==========================================================================
- * TB6612 Output (system workqueue only)
+ * PWM Output (system workqueue only)
  * ========================================================================== */
 
 static uint32_t pwm_period_cycles;
-static bool output_enabled;
+/* Pulse currently on the LED output, mirrored on the status LED */
+static uint32_t output_pulse;
+/* Set while the status LED shows the join blink instead of the mirror */
+static bool status_blinking;
 
-/* Set while the battery is below the cutoff: output is held off. */
-static atomic_t battery_low;
+static void status_pwm_set(uint32_t pulse)
+{
+	if (pwm_set_cycles(pwm_status.dev, pwm_status.channel, pwm_period_cycles,
+			   pulse, pwm_status.flags)) {
+		LOG_ERR("Status PWM set failed");
+	}
+}
 
 /*
  * CIE 1931 lightness correction.
@@ -457,61 +367,34 @@ static int output_init(void)
 	uint64_t cycles_per_sec;
 	int ret;
 
-	if (!pwm_is_ready_dt(&pwm_ain1) || !pwm_is_ready_dt(&pwm_ain2)) {
+	if (!pwm_is_ready_dt(&pwm_led)) {
 		LOG_ERR("PWM device not ready");
 		return -ENODEV;
 	}
 
-	ret = pwm_get_cycles_per_sec(pwm_ain1.dev, pwm_ain1.channel, &cycles_per_sec);
+	ret = pwm_get_cycles_per_sec(pwm_led.dev, pwm_led.channel, &cycles_per_sec);
 	if (ret < 0) {
 		return ret;
 	}
-	pwm_period_cycles = (uint32_t)(cycles_per_sec * pwm_ain1.period / NSEC_PER_SEC);
+	pwm_period_cycles = (uint32_t)(cycles_per_sec * pwm_led.period / NSEC_PER_SEC);
 
-	if (!gpio_is_ready_dt(&tb6612_pwma) || !gpio_is_ready_dt(&tb6612_standby)) {
-		LOG_ERR("TB6612 GPIO not ready");
-		return -ENODEV;
-	}
-
-	ret = gpio_pin_configure_dt(&tb6612_pwma, GPIO_OUTPUT_INACTIVE);
-	if (ret < 0) {
-		return ret;
-	}
-
-	ret = gpio_pin_configure_dt(&tb6612_standby, GPIO_OUTPUT_INACTIVE);
-	if (ret < 0) {
-		return ret;
-	}
-
-	LOG_INF("TB6612 PWM period %u cycles", pwm_period_cycles);
+	LOG_INF("PWM period %u cycles", pwm_period_cycles);
 	return 0;
 }
 
-/* Drive the strip at the given perceptual lightness (0 = off, standby). */
+/* Drive the output at the given perceptual lightness (0 = off). */
 static void output_apply(uint16_t lightness)
 {
-	/* Each polarity may be driven for at most half of the period. */
-	uint32_t pulse = atomic_get(&battery_low) ? 0 :
-			 cie1931_correct(lightness, pwm_period_cycles / 2);
+	uint32_t pulse = cie1931_correct(lightness, pwm_period_cycles);
 
-	if (pulse > 0 && !output_enabled) {
-		gpio_pin_set_dt(&tb6612_standby, 1);
-		gpio_pin_set_dt(&tb6612_pwma, 1);
-		output_enabled = true;
-	}
-
-	/* AIN2 is inverted: low for (period - pulse), then high for pulse. */
-	if (pwm_set_cycles(pwm_ain1.dev, pwm_ain1.channel, pwm_period_cycles,
-			   pulse, pwm_ain1.flags) ||
-	    pwm_set_cycles(pwm_ain2.dev, pwm_ain2.channel, pwm_period_cycles,
-			   pwm_period_cycles - pulse, pwm_ain2.flags)) {
+	if (pwm_set_cycles(pwm_led.dev, pwm_led.channel, pwm_period_cycles,
+			   pulse, pwm_led.flags)) {
 		LOG_ERR("PWM set failed");
 	}
 
-	if (pulse == 0 && output_enabled) {
-		gpio_pin_set_dt(&tb6612_pwma, 0);
-		gpio_pin_set_dt(&tb6612_standby, 0);
-		output_enabled = false;
+	output_pulse = pulse;
+	if (!status_blinking) {
+		status_pwm_set(pulse);
 	}
 }
 
@@ -674,46 +557,10 @@ static void state_save_schedule(void)
 }
 
 /* ==========================================================================
- * Sleepy End Device poll control (Zigbee thread only)
- * ========================================================================== */
-
-static bool interview_window;
-static bool ota_active;
-static zb_time_t poll_interval_ms;
-
-static void poll_update(void)
-{
-	zb_time_t interval;
-
-	if (!ZB_JOINED()) {
-		poll_interval_ms = 0;
-		return;
-	}
-
-	interval = (dev_ctx.on_off_attr.on_off || interview_window || ota_active) ?
-		   POLL_INTERVAL_FAST_MS : POLL_INTERVAL_SLOW_MS;
-
-	if (interval != poll_interval_ms) {
-		zb_zdo_pim_set_long_poll_interval(interval);
-		poll_interval_ms = interval;
-		LOG_INF("Poll interval %u ms", (unsigned int)interval);
-	}
-}
-
-static void interview_window_end(zb_uint8_t param)
-{
-	ARG_UNUSED(param);
-
-	interview_window = false;
-	poll_update();
-}
-
-/* ==========================================================================
  * Zigbee-side light control (Zigbee thread only)
  * ========================================================================== */
 
 static int64_t last_level_step_time;
-static void battery_low_force_off(zb_uint8_t param);
 
 static void level_control_set_value(zb_uint8_t new_level)
 {
@@ -734,7 +581,6 @@ static void level_control_set_value(zb_uint8_t new_level)
 		ZB_FALSE);
 
 	light_sync((since_last <= LEVEL_STEP_SMOOTH_MAX_MS) ? (uint32_t)since_last : 0);
-	poll_update();
 	state_save_schedule();
 }
 
@@ -751,13 +597,7 @@ static void on_off_set_value(zb_bool_t on)
 		ZB_FALSE);
 
 	light_sync(on_off_transition_ms());
-	poll_update();
 	state_save_schedule();
-
-	if (on && atomic_get(&battery_low)) {
-		LOG_WRN("Battery low: staying off");
-		ZB_SCHEDULE_APP_CALLBACK(battery_low_force_off, 0);
-	}
 }
 
 /* ==========================================================================
@@ -790,12 +630,6 @@ static void on_off_attr_set(zb_bool_t on)
 	ZB_ZCL_SET_ATTRIBUTE(LIGHT_ENDPOINT, ZB_ZCL_CLUSTER_ID_ON_OFF,
 			     ZB_ZCL_CLUSTER_SERVER_ROLE, ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
 			     (zb_uint8_t *)&on, ZB_FALSE);
-	poll_update();
-
-	if (on && atomic_get(&battery_low)) {
-		LOG_WRN("Battery low: staying off");
-		ZB_SCHEDULE_APP_CALLBACK(battery_low_force_off, 0);
-	}
 }
 
 /* ExecuteIfOff after applying the command's OptionsMask/OptionsOverride. */
@@ -1019,356 +853,14 @@ static void identify_cb(zb_bufid_t bufid)
 }
 
 /* ==========================================================================
- * Battery Measurement - LiPo via external divider
- * ========================================================================== */
-
-/*
- * LiPo voltage to percentage lookup table (typical discharge curve, mV).
- */
-struct battery_level_point {
-	uint16_t mv;      /* Voltage in millivolts */
-	uint8_t  percent; /* Percentage (0-100) */
-};
-
-static const struct battery_level_point lipo_discharge_curve[] = {
-	{ 4200, 100 },
-	{ 4150,  95 },
-	{ 4110,  90 },
-	{ 4080,  85 },
-	{ 4020,  80 },
-	{ 3980,  75 },
-	{ 3950,  70 },
-	{ 3910,  65 },
-	{ 3870,  60 },
-	{ 3840,  55 },
-	{ 3800,  50 },
-	{ 3760,  45 },
-	{ 3730,  40 },
-	{ 3690,  35 },
-	{ 3660,  30 },
-	{ 3620,  25 },
-	{ 3580,  20 },
-	{ 3500,  15 },
-	{ 3450,  10 },
-	{ 3300,   5 },
-	{ 3000,   0 },
-};
-
-#define BATTERY_CURVE_SIZE ARRAY_SIZE(lipo_discharge_curve)
-
-/**
- * Convert battery voltage (mV) to percentage using lookup table with interpolation.
- */
-static uint8_t battery_mv_to_percent(uint16_t mv)
-{
-	if (mv >= lipo_discharge_curve[0].mv) {
-		return 100;
-	}
-
-	if (mv <= lipo_discharge_curve[BATTERY_CURVE_SIZE - 1].mv) {
-		return 0;
-	}
-
-	for (size_t i = 0; i < BATTERY_CURVE_SIZE - 1; i++) {
-		if (mv >= lipo_discharge_curve[i + 1].mv) {
-			uint16_t v_high = lipo_discharge_curve[i].mv;
-			uint16_t v_low = lipo_discharge_curve[i + 1].mv;
-			uint8_t p_high = lipo_discharge_curve[i].percent;
-			uint8_t p_low = lipo_discharge_curve[i + 1].percent;
-
-			return p_low + ((mv - v_low) * (p_high - p_low)) / (v_high - v_low);
-		}
-	}
-
-	return 0;
-}
-
-/* Battery voltage filtering */
-#define BATTERY_OVERSAMPLE_SHIFT  3     /* 2^3 = 8x hardware oversampling */
-#define BATTERY_SOFTWARE_SAMPLES  4     /* Additional software averaging */
-#define BATTERY_FILTER_ALPHA      64    /* EMA alpha (0-256), 64 = ~25% new value */
-
-static const struct device *adc_dev;
-static struct k_work_delayable battery_work;
-static uint16_t battery_filtered_mv;    /* Exponential moving average result */
-/* Restart the average with the next sample (after charging) */
-static bool battery_filter_reset;
-/* Send a report to the coordinator after the next measurement */
-static atomic_t battery_report_pending;
-
-/**
- * Measure battery voltage using external voltage divider with filtering.
- *
- * Hardware: VBATT -> 1MΩ -> P0.31 (AIN7) -> 1MΩ -> P0.29
- * - Drive P0.29 LOW to enable divider (creates path to GND)
- * - Measure VBATT/2 on P0.31 (AIN7)
- * - Set P0.29 to high-impedance when done so the divider draws no current
- *
- * Returns filtered battery voltage in millivolts, 0 on failure.
- */
-static uint16_t battery_measure_mv(void)
-{
-	int16_t sample;
-	int32_t sample_sum = 0;
-	uint16_t voltage_mv;
-	int ret;
-
-	if (!adc_dev) {
-		return 0;
-	}
-
-	ret = gpio_pin_configure_dt(&batt_divider_gnd, GPIO_OUTPUT_LOW);
-	if (ret < 0) {
-		LOG_ERR("Failed to enable battery divider: %d", ret);
-		return 0;
-	}
-
-	/* Wait for voltage to settle through high-impedance divider */
-	k_usleep(500);
-
-	/*
-	 * Internal 0.6 V reference, gain 1/6 -> 3.6 V full scale, 12-bit.
-	 * Pin sees VBATT/2: VBATT_mV = sample * 3600 * 2 / 4096.
-	 */
-	struct adc_channel_cfg channel_cfg = {
-		.gain = ADC_GAIN_1_6,
-		.reference = ADC_REF_INTERNAL,
-		.acquisition_time = ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40),
-		.channel_id = 0,
-		.input_positive = NRF_SAADC_INPUT_AIN7,  /* P0.31 */
-	};
-
-	ret = adc_channel_setup(adc_dev, &channel_cfg);
-	if (ret < 0) {
-		LOG_ERR("ADC channel setup failed: %d", ret);
-		goto disable_divider;
-	}
-
-	struct adc_sequence sequence = {
-		.channels = BIT(0),
-		.buffer = &sample,
-		.buffer_size = sizeof(sample),
-		.resolution = 12,
-		.oversampling = BATTERY_OVERSAMPLE_SHIFT,
-	};
-
-	for (int i = 0; i < BATTERY_SOFTWARE_SAMPLES; i++) {
-		/* SAADC offset calibration before the first sample */
-		sequence.calibrate = (i == 0);
-		ret = adc_read(adc_dev, &sequence);
-		if (ret < 0) {
-			LOG_ERR("ADC read failed: %d", ret);
-			goto disable_divider;
-		}
-		sample_sum += MAX(sample, 0);
-	}
-
-	voltage_mv = (uint32_t)(sample_sum / BATTERY_SOFTWARE_SAMPLES) * 7200U / 4096U;
-
-	if (battery_filtered_mv == 0 || battery_filter_reset) {
-		battery_filtered_mv = voltage_mv;
-		battery_filter_reset = false;
-	} else {
-		battery_filtered_mv = ((uint32_t)BATTERY_FILTER_ALPHA * voltage_mv +
-			(256 - BATTERY_FILTER_ALPHA) * battery_filtered_mv) / 256;
-	}
-
-	LOG_DBG("Battery: raw=%umV, filtered=%umV", voltage_mv, battery_filtered_mv);
-
-disable_divider:
-	gpio_pin_configure_dt(&batt_divider_gnd, GPIO_DISCONNECTED);
-
-	return (ret < 0) ? 0 : battery_filtered_mv;
-}
-
-static void battery_attrs_store(uint16_t voltage_mv)
-{
-	dev_ctx.power_config_attr.battery_voltage = voltage_mv / 100;
-	dev_ctx.power_config_attr.battery_percentage = battery_mv_to_percent(voltage_mv) * 2;
-	dev_ctx.power_config_attr.battery_voltage_raw_mv = voltage_mv;
-}
-
-/* Publish a new measurement through ZCL so configured reporting picks it up. */
-static void battery_publish(zb_uint8_t param)
-{
-	ARG_UNUSED(param);
-
-	uint16_t mv = battery_filtered_mv;
-	zb_uint8_t voltage = mv / 100;
-	zb_uint8_t percentage = battery_mv_to_percent(mv) * 2;
-
-	ZB_ZCL_SET_ATTRIBUTE(LIGHT_ENDPOINT, ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-			     ZB_ZCL_CLUSTER_SERVER_ROLE,
-			     ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,
-			     &voltage, ZB_FALSE);
-	ZB_ZCL_SET_ATTRIBUTE(LIGHT_ENDPOINT, ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-			     ZB_ZCL_CLUSTER_SERVER_ROLE,
-			     ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
-			     &percentage, ZB_FALSE);
-	ZB_ZCL_SET_ATTRIBUTE(LIGHT_ENDPOINT, ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-			     ZB_ZCL_CLUSTER_SERVER_ROLE,
-			     ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_RAW_MV_ID,
-			     (zb_uint8_t *)&mv, ZB_FALSE);
-
-	LOG_INF("Battery: %u mV (%u%%)", mv, percentage / 2);
-}
-
-/* Zigbee thread: switch the light off while the battery is low. */
-static void battery_low_force_off(zb_uint8_t param)
-{
-	ARG_UNUSED(param);
-
-	if (atomic_get(&battery_low) && dev_ctx.on_off_attr.on_off) {
-		on_off_set_value(ZB_FALSE);
-	}
-}
-
-/* Zigbee thread: send current battery attributes to the coordinator. */
-static void battery_report_send(zb_bufid_t bufid)
-{
-	zb_uint8_t *ptr = ZB_ZCL_START_PACKET(bufid);
-	zb_uint16_t coordinator = 0x0000;
-
-	ZB_ZCL_CONSTRUCT_SET_FRAME_CONTROL(*ptr, ZB_ZCL_FRAME_TYPE_COMMON,
-					   ZB_ZCL_NOT_MANUFACTURER_SPECIFIC,
-					   ZB_ZCL_FRAME_DIRECTION_TO_CLI,
-					   ZB_ZCL_DISABLE_DEFAULT_RESPONSE);
-	ptr++;
-	ZB_ZCL_CONSTRUCT_COMMAND_HEADER(ptr, ZB_ZCL_GET_SEQ_NUM(), ZB_ZCL_CMD_REPORT_ATTRIB);
-
-	ZB_ZCL_PACKET_PUT_DATA16_VAL(ptr, ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID);
-	ZB_ZCL_PACKET_PUT_DATA8(ptr, ZB_ZCL_ATTR_TYPE_U8);
-	ZB_ZCL_PACKET_PUT_DATA8(ptr, dev_ctx.power_config_attr.battery_voltage);
-
-	ZB_ZCL_PACKET_PUT_DATA16_VAL(ptr, ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID);
-	ZB_ZCL_PACKET_PUT_DATA8(ptr, ZB_ZCL_ATTR_TYPE_U8);
-	ZB_ZCL_PACKET_PUT_DATA8(ptr, dev_ctx.power_config_attr.battery_percentage);
-
-	ZB_ZCL_PACKET_PUT_DATA16_VAL(ptr, ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_RAW_MV_ID);
-	ZB_ZCL_PACKET_PUT_DATA8(ptr, ZB_ZCL_ATTR_TYPE_U16);
-	ZB_ZCL_PACKET_PUT_DATA16_VAL(ptr, dev_ctx.power_config_attr.battery_voltage_raw_mv);
-
-	ZB_ZCL_FINISH_N_SEND_PACKET(bufid, ptr, coordinator, ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
-				    1, LIGHT_ENDPOINT, ZB_AF_HA_PROFILE_ID,
-				    ZB_ZCL_CLUSTER_ID_POWER_CONFIG, NULL);
-}
-
-static void battery_report(zb_uint8_t param)
-{
-	ARG_UNUSED(param);
-
-	if (ZB_JOINED()) {
-		zb_buf_get_out_delayed(battery_report_send);
-	}
-}
-
-/* Workqueue: apply the low-battery hysteresis to a resting measurement. */
-static void battery_low_update(uint16_t mv)
-{
-	if (!atomic_get(&battery_low) && mv < BATTERY_CUTOFF_MV) {
-		LOG_WRN("Battery %u mV below cutoff: output off", mv);
-		atomic_set(&battery_low, 1);
-		ZB_SCHEDULE_APP_CALLBACK(battery_low_force_off, 0);
-	} else if (atomic_get(&battery_low) && mv >= BATTERY_RESUME_MV) {
-		LOG_INF("Battery %u mV recovered", mv);
-		atomic_clear(&battery_low);
-	}
-}
-
-static void battery_work_handler(struct k_work *work)
-{
-	ARG_UNUSED(work);
-
-	if (nrf_power_usbregstatus_vbusdet_get(NRF_POWER)) {
-		/* Charging: the reading would be the charge voltage. */
-		battery_filter_reset = true;
-		if (atomic_clear(&battery_low)) {
-			output_apply(fade_now());
-		}
-	} else {
-		/* Measure at rest: blank a lit strip for the ~2 ms of sampling. */
-		bool lit = output_enabled;
-		uint16_t mv;
-
-		if (lit) {
-			output_apply(0);
-		}
-		mv = battery_measure_mv();
-
-		if (mv > 0) {
-			battery_low_update(mv);
-			ZB_SCHEDULE_APP_CALLBACK(battery_publish, 0);
-		} else {
-			LOG_WRN("Battery measurement failed");
-		}
-
-		if (lit) {
-			output_apply(fade_now());
-		}
-	}
-
-	if (atomic_clear(&battery_report_pending)) {
-		ZB_SCHEDULE_APP_CALLBACK(battery_report, 0);
-	}
-
-	k_work_schedule(&battery_work, K_SECONDS(BATTERY_REPORT_INTERVAL_SEC));
-}
-
-/* Zigbee thread: measure and report shortly after (re)joining. */
-static void battery_report_after_join(void)
-{
-	atomic_set(&battery_report_pending, 1);
-	k_work_reschedule(&battery_work, K_SECONDS(BATTERY_JOIN_REPORT_DELAY_SEC));
-}
-
-/* Must run before the Zigbee stack starts: writes attributes directly. */
-static void battery_init(void)
-{
-	if (!gpio_is_ready_dt(&batt_divider_gnd) ||
-	    gpio_pin_configure_dt(&batt_divider_gnd, GPIO_DISCONNECTED) < 0) {
-		LOG_WRN("Battery divider GPIO unavailable");
-		return;
-	}
-
-	adc_dev = DEVICE_DT_GET(DT_NODELABEL(adc));
-	if (!device_is_ready(adc_dev)) {
-		LOG_WRN("ADC device not ready");
-		adc_dev = NULL;
-		return;
-	}
-
-	dev_ctx.power_config_attr.battery_size = ZB_ZCL_POWER_CONFIG_BATTERY_SIZE_OTHER; /* LiPo */
-	dev_ctx.power_config_attr.battery_quantity = 1;
-	dev_ctx.power_config_attr.battery_rated_voltage = 37; /* 3.7V nominal in 100mV units */
-	dev_ctx.power_config_attr.battery_alarm_mask = 0;
-	dev_ctx.power_config_attr.battery_voltage_min_threshold = 30; /* 3.0V in 100mV units */
-
-	/* Valid values before the coordinator interviews the device */
-	uint16_t voltage_mv = battery_measure_mv();
-
-	if (voltage_mv > 0) {
-		battery_attrs_store(voltage_mv);
-		LOG_INF("Initial battery: %u mV", voltage_mv);
-
-		if (nrf_power_usbregstatus_vbusdet_get(NRF_POWER)) {
-			/* Charge voltage: replace with the first resting sample */
-			battery_filter_reset = true;
-		} else if (voltage_mv < BATTERY_CUTOFF_MV) {
-			LOG_WRN("Battery %u mV below cutoff: output off", voltage_mv);
-			atomic_set(&battery_low, 1);
-		}
-	}
-
-	k_work_schedule(&battery_work, K_SECONDS(BATTERY_REPORT_INTERVAL_SEC));
-}
-
-/* ==========================================================================
- * Status LED - blinks while not joined (bounded), off otherwise
+ * Status LED - blinks while not joined (bounded), else mirrors the output
+ * (system workqueue, same as output_apply)
  * ========================================================================== */
 
 static struct k_work_delayable status_led_work;
 static atomic_t zb_joined;
 static atomic_t blink_deadline;  /* k_uptime_get_32() value */
+static bool status_blink_on;
 
 static void status_led_work_handler(struct k_work *work)
 {
@@ -1377,11 +869,14 @@ static void status_led_work_handler(struct k_work *work)
 	int32_t remaining = (int32_t)((uint32_t)atomic_get(&blink_deadline) - k_uptime_get_32());
 
 	if (atomic_get(&zb_joined) || remaining <= 0) {
-		gpio_pin_set_dt(&status_led, 0);
+		status_blinking = false;
+		status_pwm_set(output_pulse);
 		return;
 	}
 
-	gpio_pin_toggle_dt(&status_led);
+	status_blinking = true;
+	status_blink_on = !status_blink_on;
+	status_pwm_set(status_blink_on ? pwm_period_cycles : 0);
 	k_work_schedule(&status_led_work, K_MSEC(JOIN_BLINK_PERIOD_MS));
 }
 
@@ -1573,65 +1068,6 @@ static void watchdog_start(void)
 }
 
 /* ==========================================================================
- * USB plug-in -> reboot into the MCUboot USB update window
- * ========================================================================== */
-
-static struct k_work_delayable usb_reboot_work;
-/* Set once USB power has been seen absent, so only a real plug-in counts. */
-static atomic_t usb_was_absent;
-
-static void usb_reboot_work_handler(struct k_work *work)
-{
-	ARG_UNUSED(work);
-
-	if (!nrf_power_usbregstatus_vbusdet_get(NRF_POWER)) {
-		return;
-	}
-
-	LOG_INF("USB connected: rebooting into bootloader update window");
-	k_work_cancel_delayable(&save_work);
-	save_work_handler(NULL);
-	sys_reboot(SYS_REBOOT_COLD);
-}
-
-static void usb_power_handler(nrfx_power_usb_evt_t event)
-{
-	if (event == NRFX_POWER_USB_EVT_DETECTED) {
-		if (atomic_get(&usb_was_absent)) {
-			k_work_reschedule(&usb_reboot_work, K_MSEC(USB_REBOOT_DELAY_MS));
-		}
-		/* Releases the low-battery cutoff */
-		k_work_reschedule(&battery_work, K_NO_WAIT);
-	} else if (event == NRFX_POWER_USB_EVT_REMOVED) {
-		atomic_set(&usb_was_absent, 1);
-		k_work_cancel_delayable(&usb_reboot_work);
-		atomic_set(&battery_report_pending, 1);
-		k_work_reschedule(&battery_work, K_SECONDS(BATTERY_AFTER_USB_DELAY_SEC));
-	}
-}
-
-/* Only plugging USB in after it was absent triggers a reboot. */
-static void usb_detect_init(void)
-{
-	/* Keep the regulator configuration set up at boot */
-	const nrfx_power_config_t power_cfg = {
-		.dcdcen = nrf_power_dcdcen_get(NRF_POWER),
-		.dcdcenhv = nrf_power_dcdcen_vddh_get(NRF_POWER),
-	};
-	const nrfx_power_usbevt_config_t usbevt_cfg = {
-		.handler = usb_power_handler,
-	};
-
-	(void)nrfx_power_init(&power_cfg);
-	atomic_set(&usb_was_absent, !nrf_power_usbregstatus_vbusdet_get(NRF_POWER));
-	nrfx_power_usbevt_init(&usbevt_cfg);
-	nrf_power_event_clear(NRF_POWER, NRF_POWER_EVENT_USBDETECTED);
-	nrf_power_event_clear(NRF_POWER, NRF_POWER_EVENT_USBREMOVED);
-	nrf_power_event_clear(NRF_POWER, NRF_POWER_EVENT_USBPWRRDY);
-	nrfx_power_usbevt_enable();
-}
-
-/* ==========================================================================
  * Zigbee Attribute Initialization
  * ========================================================================== */
 
@@ -1641,7 +1077,7 @@ static void clusters_attr_init(void)
 	dev_ctx.basic_attr.app_version = BULB_INIT_BASIC_APP_VERSION;
 	dev_ctx.basic_attr.stack_version = BULB_INIT_BASIC_STACK_VERSION;
 	dev_ctx.basic_attr.hw_version = BULB_INIT_BASIC_HW_VERSION;
-	dev_ctx.basic_attr.power_source = ZB_ZCL_BASIC_POWER_SOURCE_BATTERY;
+	dev_ctx.basic_attr.power_source = ZB_ZCL_BASIC_POWER_SOURCE_DC_SOURCE;
 	dev_ctx.basic_attr.ph_env = BULB_INIT_BASIC_PH_ENV;
 
 	ZB_ZCL_SET_STRING_VAL(
@@ -1741,11 +1177,6 @@ static void fota_evt_handler(const struct zigbee_fota_evt *evt)
 	switch (evt->id) {
 	case ZIGBEE_FOTA_EVT_PROGRESS:
 		LOG_INF("OTA progress: %d%%", evt->dl.progress);
-		if (!ota_active) {
-			/* Download over a slow-polling link would take hours */
-			ota_active = true;
-			poll_update();
-		}
 		break;
 
 	case ZIGBEE_FOTA_EVT_FINISHED:
@@ -1755,8 +1186,6 @@ static void fota_evt_handler(const struct zigbee_fota_evt *evt)
 
 	case ZIGBEE_FOTA_EVT_ERROR:
 		LOG_ERR("OTA transfer failed");
-		ota_active = false;
-		poll_update();
 		break;
 
 	default:
@@ -1823,7 +1252,6 @@ void zboss_signal_handler(zb_bufid_t bufid)
 {
 	zb_zdo_app_signal_hdr_t *sig_hdr = NULL;
 	zb_zdo_app_signal_type_t sig_type = zb_get_app_signal(bufid, &sig_hdr);
-	zb_ret_t status = ZB_GET_APP_SIGNAL_STATUS(bufid);
 #ifdef CONFIG_ZIGBEE_FOTA
 	zigbee_fota_signal_handler(bufid);
 #endif
@@ -1832,25 +1260,6 @@ void zboss_signal_handler(zb_bufid_t bufid)
 	case ZB_BDB_SIGNAL_DEVICE_FIRST_START:
 	case ZB_BDB_SIGNAL_DEVICE_REBOOT:
 		watchdog_start();
-		battery_low_force_off(0);
-		if (sig_type == ZB_BDB_SIGNAL_DEVICE_REBOOT && status == RET_OK) {
-			battery_report_after_join();
-		}
-		break;
-
-	case ZB_BDB_SIGNAL_STEERING:
-		if (status == RET_OK) {
-			battery_report_after_join();
-			/* Newly joined: poll fast while the coordinator interviews us */
-			interview_window = true;
-			ZB_SCHEDULE_APP_ALARM_CANCEL(interview_window_end, ZB_ALARM_ANY_PARAM);
-			ZB_SCHEDULE_APP_ALARM(interview_window_end, 0,
-				ZB_MILLISECONDS_TO_BEACON_INTERVAL(INTERVIEW_FAST_POLL_MS));
-		}
-		break;
-
-	case ZB_ZDO_SIGNAL_LEAVE:
-		interview_window = false;
 		break;
 
 	default:
@@ -1861,7 +1270,6 @@ void zboss_signal_handler(zb_bufid_t bufid)
 
 	if (sig_type != ZB_COMMON_SIGNAL_CAN_SLEEP) {
 		joined_state_update();
-		poll_update();
 	}
 
 	if (bufid) {
@@ -1882,18 +1290,11 @@ static int hardware_init(void)
 		return ret;
 	}
 
-	if (gpio_is_ready_dt(&status_led)) {
-		gpio_pin_configure_dt(&status_led, GPIO_OUTPUT_INACTIVE);
-	}
-
 	ret = button_init();
 	if (ret < 0) {
 		LOG_ERR("Button init failed: %d", ret);
 		return ret;
 	}
-
-	battery_init();
-	usb_detect_init();
 
 	return 0;
 }
@@ -1911,11 +1312,9 @@ int main(void)
 	k_work_init_delayable(&fade_work, fade_work_handler);
 	k_work_init_delayable(&effect_work, effect_work_handler);
 	k_work_init_delayable(&save_work, save_work_handler);
-	k_work_init_delayable(&battery_work, battery_work_handler);
 	k_work_init_delayable(&status_led_work, status_led_work_handler);
 	k_work_init_delayable(&button_work, button_work_handler);
 	k_work_init_delayable(&long_press_work, long_press_work_handler);
-	k_work_init_delayable(&usb_reboot_work, usb_reboot_work_handler);
 	k_work_init_delayable(&wdt_work, wdt_work_handler);
 
 	watchdog_init();
@@ -1964,12 +1363,8 @@ int main(void)
 	/* Join indication until the stack reports a network */
 	status_led_blink();
 
-	/*
-	 * Sleepy End Device: radio off between polls. The parent keeps us in
-	 * its child table for 64 min without contact.
-	 */
+	/* Rx-on End Device: the parent keeps us for 64 min without contact. */
 	zb_set_ed_timeout(ED_AGING_TIMEOUT_64MIN);
-	zigbee_configure_sleepy_behavior(true);
 
 	if (IS_ENABLED(CONFIG_RAM_POWER_DOWN_LIBRARY)) {
 		power_down_unused_ram();

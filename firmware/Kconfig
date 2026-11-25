@@ -2,14 +2,6 @@
 
 menu "Application Configuration"
 
-config APP_BATTERY_REPORT_INTERVAL_SEC
-	int "Battery measurement interval in seconds"
-	default 600
-	help
-	  How often to measure the battery and update the Power Configuration
-	  attributes. Reports are sent according to the reporting
-	  configuration set by the coordinator.
-
 endmenu
 
 source "Kconfig.zephyr"
