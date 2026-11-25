@@ -2,7 +2,7 @@
  * Device Tree Overlay for LED Copper String Controller (simple PWM variant)
  * Target: Pro Micro nRF52840 (SuperMini, nice!nano compatible)
  *
- * - LED PWM:        P0.10 - PWM0 ch0, 1 kHz, active high
+ * - LED PWM:        P0.10 - PWM0 ch0, 1 kHz, active low (inverted)
  * - Pairing Button: P0.06 (D1) - Active low with internal pull-up
  * - Status LED:     P0.15 (onboard) - PWM0 ch1: mirrors the LED PWM, blinks
  *                   while not joined
@@ -28,7 +28,7 @@
 		compatible = "pwm-leds";
 
 		led_pwm: led_pwm {
-			pwms = <&pwm0 0 PWM_MSEC(1) PWM_POLARITY_NORMAL>;
+			pwms = <&pwm0 0 PWM_MSEC(1) PWM_POLARITY_INVERTED>;
 			label = "LED PWM";
 		};
 

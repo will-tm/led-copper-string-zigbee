@@ -8,7 +8,7 @@ Zigbee-controlled LED copper string light, simple variant: one PWM output on P0.
 
 | Function | Pin |
 |----------|-----|
-| LED PWM (1 kHz, active high) | P0.10 |
+| LED PWM (1 kHz, active low) | P0.10 |
 
 P0.10 is an NFC pin; it is configured as GPIO through UICR (set by the board definition).
 
@@ -71,7 +71,7 @@ Short press toggles the light.
 ## Operation
 
 - **ON:** P0.10 PWM at 1 kHz, duty cycle = brightness. Generated fully in hardware, no CPU wake-ups.
-- **OFF:** P0.10 low; PWM peripheral stopped
+- **OFF:** P0.10 high; PWM peripheral stopped
 - **Brightness:** CIE 1931 perceptual correction for smooth dimming
 - **Transitions:** On/off fades use the OnOffTransitionTime attribute (default 1 s, 0 = instant); level transitions are smoothed between steps
 - **Power-on behavior:** StartUpOnOff / StartUpCurrentLevel are honored and persisted

@@ -2,7 +2,7 @@
  * @file main.c
  * @brief LED Copper String Zigbee Controller
  *
- * Single PWM output on P0.10 (1 kHz, active high), brightness set by its
+ * Single PWM output on P0.10 (1 kHz, active low), brightness set by its
  * duty cycle. Generated in hardware; at 0 the PWM peripheral is stopped.
  *
  * Threading:
